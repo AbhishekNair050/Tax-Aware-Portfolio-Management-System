@@ -1161,47 +1161,86 @@ class TaxAwarePortfolioAPI:
         @self.api_router.post("/models/load", tags=["Models"])
         async def load_model_api(request: dict):
             """Load a model from disk and mark as active."""
-            model_path_value = request.get('model_path')
-            if not model_path_value:
-                raise HTTPException(status_code=400, detail="model_path is required")
+            try:
+                model_path_value = request.get('model_path')
+                if not model_path_value:
+                    raise HTTPException(status_code=400, detail="model_path is required")
 
-            candidate = Path(model_path_value)
-            if not candidate.is_file():
-                models_dir = Path("../models")
-                alt_path = models_dir / candidate.name
-                if alt_path.is_file():
-                    candidate = alt_path
-                else:
-                    raise HTTPException(status_code=404, detail=f"Model not found: {model_path_value}")
-
-            metadata = {}
-            metadata_candidates = [
-                candidate.with_suffix('.json'),
-                candidate.parent / f"{candidate.stem}_metadata.json"
-            ]
-            for meta_path in metadata_candidates:
-                if meta_path.is_file():
-                    try:
-                        with open(meta_path, 'r') as meta_file:
-                            metadata = json.load(meta_file)
-                    except Exception as exc:
-                        logger.warning(f"Failed to load metadata from {meta_path}: {exc}")
+                candidate = Path(model_path_value)
+                if not candidate.is_file():
+                    models_dir = Path("../models")
+                    alt_path = models_dir / candidate.name
+                    if alt_path.is_file():
+                        candidate = alt_path
                     else:
-                        break
+                        raise HTTPException(status_code=404, detail=f"Model not found: {model_path_value}")
 
-            self.active_model_info = {
-                "name": candidate.name,
-                "path": str(candidate.resolve()),
-                "size_mb": round(candidate.stat().st_size / (1024 * 1024), 2),
-                "metadata": metadata,
-                "loaded_at": dt.datetime.now().isoformat()
-            }
+                # Load metadata
+                metadata = {}
+                metadata_candidates = [
+                    candidate.with_suffix('.json'),
+                    candidate.parent / f"{candidate.stem}_metadata.json"
+                ]
+                for meta_path in metadata_candidates:
+                    if meta_path.is_file():
+                        try:
+                            with open(meta_path, 'r') as meta_file:
+                                metadata = json.load(meta_file)
+                        except Exception as exc:
+                            logger.warning(f"Failed to load metadata from {meta_path}: {exc}")
+                        else:
+                            break
 
-            return {
-                "success": True,
-                "message": f"Model loaded: {candidate.name}",
-                "model_info": self.active_model_info
-            }
+                # Get environment configuration from metadata or use defaults
+                symbols = metadata.get('symbols', ['AAPL', 'MSFT', 'GOOGL'])
+                initial_cash = metadata.get('initial_cash', 1000000.0)
+                
+                # Create environment
+                env = TaxAwarePortfolioEnv(
+                    symbols=symbols,
+                    initial_cash=initial_cash,
+                    start_date='2020-01-01',
+                    end_date='2023-12-31'
+                )
+                
+                # Create agent
+                state_dim = env.observation_space.shape[0]
+                action_dim = env.action_space.shape[0]
+                agent = SoftActorCritic(state_dim=state_dim, action_dim=action_dim)
+                
+                # Load model weights
+                agent.load_model(str(candidate))
+                
+                # Store loaded model
+                self.active_model_info = {
+                    "name": candidate.name,
+                    "path": str(candidate.resolve()),
+                    "size_mb": round(candidate.stat().st_size / (1024 * 1024), 2),
+                    "metadata": metadata,
+                    "loaded_at": dt.datetime.now().isoformat(),
+                    "agent": agent,
+                    "env": env
+                }
+
+                logger.info(f"✅ Model loaded successfully: {candidate.name}")
+                
+                return {
+                    "success": True,
+                    "message": f"Model loaded: {candidate.name}",
+                    "model_info": {
+                        "name": self.active_model_info["name"],
+                        "path": self.active_model_info["path"],
+                        "size_mb": self.active_model_info["size_mb"],
+                        "metadata": self.active_model_info["metadata"],
+                        "loaded_at": self.active_model_info["loaded_at"]
+                    }
+                }
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error loading model: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
         
         @self.api_router.post("/models/save", tags=["Models"])
         async def save_model_api(request: dict):
@@ -1381,18 +1420,58 @@ class TaxAwarePortfolioAPI:
     # Helper methods
     async def _run_training_async(self, trainer_id: str, trainer: TaxAwareRLTrainer, 
                                 num_episodes: int, validate_every: int, save_every: int):
-        """Run training asynchronously."""
+        """Run training asynchronously with progress tracking."""
         try:
             trainer_session = self.active_trainers[trainer_id]
             trainer_session['status'] = 'training'
             trainer_session['started_at'] = dt.datetime.now().isoformat()
             
-            # Run training
-            result = trainer.train(
-                num_episodes=num_episodes,
-                validate_every=validate_every,
-                save_every=save_every
-            )
+            # Create a wrapper function that updates progress
+            def train_with_progress():
+                # Store original episode count
+                original_total = trainer.total_episodes
+                
+                # Run training
+                result = trainer.train(
+                    num_episodes=num_episodes,
+                    validate_every=validate_every,
+                    save_every=save_every
+                )
+                
+                return result
+            
+            # Start training in background with periodic progress updates
+            loop = asyncio.get_event_loop()
+            
+            # Create a task to periodically update progress
+            async def update_progress():
+                while trainer_session['status'] == 'training':
+                    await asyncio.sleep(2)  # Update every 2 seconds
+                    if trainer.total_episodes > 0:
+                        progress = (trainer.total_episodes / num_episodes) * 100
+                        trainer_session['progress'] = min(progress, 99.9)
+                        trainer_session['current_episode'] = trainer.total_episodes
+                        
+                        # Update with latest metrics if available
+                        if hasattr(trainer, 'metrics') and trainer.metrics.episode_metrics:
+                            latest_metrics = trainer.metrics.episode_metrics[-1] if trainer.metrics.episode_metrics else {}
+                            trainer_session['metrics'] = {
+                                'latest_episode': latest_metrics,
+                                'total_episodes': trainer.total_episodes
+                            }
+            
+            # Start progress updater
+            progress_task = asyncio.create_task(update_progress())
+            
+            # Run training in thread pool to avoid blocking
+            result = await loop.run_in_executor(None, train_with_progress)
+            
+            # Cancel progress updater
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
             
             if trainer.training_interrupted:
                 trainer_session['status'] = 'stopped'

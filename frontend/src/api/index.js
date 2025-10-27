@@ -2,7 +2,7 @@ import axios from 'axios';
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 30000,
+  timeout: 300000, // 5 minutes for long-running operations like training
   headers: {
     'Content-Type': 'application/json',
   },
@@ -14,7 +14,7 @@ export const getSystemInfo = () => api.get('/system/info');
 export const getSystemHealth = () => api.get('/system/health');
 
 // Training API
-export const startTraining = (config) => api.post('/training/start', config);
+export const startTraining = (config) => api.post('/training/start', config, { timeout: 60000 }); // 1 minute for start
 export const getTrainingStatus = (sessionId) => api.get(`/training/status/${sessionId}`);
 export const stopTraining = (sessionId) => api.post(`/training/stop/${sessionId}`);
 export const listTrainingSessions = () => api.get('/training/sessions');
